@@ -1,643 +1,974 @@
-# tidal.py — Ambient Voice Field
-# ─────────────────────────────────────────────────────────────────────────────
-# Six independent sustained voices, each on its own MIDI channel (1-6).
-# Voices wake slowly, drift between notes, and sleep again — with or without
-# you. Hold Shift (btn 7) for deeper controls. See CONTROLS below.
+# code.py — Wolfpunk Weather Station
+# =============================================================================
+# A three-element weather instrument for the RP2040 pad controller.
 #
-# CONTROLS
-# ────────────────────────────────────────────────────────────────────────────
-# Buttons 1-6 : Toggle voice on / off  (wakes slowly, releases slowly)
-# Button 7    : [tap] Cycle scale   [hold] Shift key for combos below
-# Button 8    : [short] Start Breathe  [mid-breathe: reverse it]
-#               [long >0.5s] Panic reset
+#   LEFT HAND   yellow keys 1 2 3  =  SUN, WIND, RAIN   (momentary modifiers)
+#   RIGHT HAND  white keys  4 - 8  =  five degrees of the current scale
 #
-# Shift + 1   : Root note  ↓ one octave
-# Shift + 2   : Root note  ↑ one octave
-# Shift + 3   : Cycle Gravity mode  (Float → Root Pull → Cluster → Spread)
-# Shift + 4   : Cycle Drift speed   (Glacial → Medium → Restless)
-# Shift + 5   : Scatter  (nudge all active voices to random new scale tones)
-# Shift + 6   : Release all  (gracefully fades everything to silence)
-# Shift + 8   : Outro  (all voices begin a very long ~50s fade to silence)
+# The three elements are ORTHOGONAL. Each one applies its own transformation,
+# and they stack, so eight distinct weather systems fall out of three keys:
 #
-# GRAVITY MODES
-# ────────────────────────────────────────────────────────────────────────────
-# Float      — voices wander freely: random ±1-2 scale steps
-# Root Pull  — voices gravitate back toward root and fifth
-# Cluster    — voices drift toward each other (density builds)
-# Spread     — voices drift apart (harmony opens up)
+#   —            Clear      plain sustained notes, one per key
+#   SUN          Sunshine   notes bloom into a shimmering chord, an octave up
+#   WIND         Breeze     gusts bend and wobble the pitch; a drifting
+#                           companion voice wanders around what you hold
+#   RAIN         Rain       every held key trickles droplets down the scale
+#   SUN + WIND   Heat Haze  shimmering chords with deep, slow heat-wobble
+#   SUN + RAIN   Rainbow    droplets climb upward instead of falling
+#   WIND + RAIN  Squall     droplets scattered wide, and thunder starts
+#   ALL THREE    Storm      the whole system at once, thunder frequent
 #
-# MIDI
-# ────────────────────────────────────────────────────────────────────────────
-# CC 11 (Expression) — per-voice dynamic envelopes (attack / release)
-# CC  1 (Mod Wheel)  — slow sinusoidal modulation per voice for timbre movement
-# CC  7 (Volume)     — global swell during Breathe
-# Channels 1-6 (voices 0-5) — assign a slow-attack pad preset to each
-# ─────────────────────────────────────────────────────────────────────────────
+# TAP a yellow key ON ITS OWN (no notes, no other modifier) to change a
+# setting rather than play:
+#
+#   tap SUN    cycle scale        Clear / Overcast / Frost / Monsoon /
+#                                 Aurora / Drought        (vertical bars)
+#   tap WIND   cycle octave       C2 / C3 / C4 / C5       (horizontal bars)
+#   tap RAIN   cycle rain rate    Drizzle / Shower / Downpour  (dashes)
+#
+#   hold ALL THREE for 1.2s with no notes  ->  PANIC: all notes off, reset
+#
+# MIDI CHANNELS (assign a different sound to each for the full effect)
+# -----------------------------------------------------------------------------
+#   1  Main     what your right hand plays — lead or pad, needs sustain
+#   2  Sun      harmony shimmer — bells, glass, bright plucks
+#   3  Rain     droplets — short plucks, marimba, dripping water
+#   4  Wind     drifting companion voice — airy pad, breathy
+#   5  Thunder  low hits — sub bass, timpani, boom
+#
+# Continuous controllers: CC1 mod (wind wobble), CC74 brightness (sun),
+# CC91 reverb (rain wetness), CC10 pan (wind sweep), pitch bend (gusts).
+# Everything is sent to BOTH USB MIDI and the UART (DIN) MIDI out on GP4.
+#
+# DISPLAY
+# -----------------------------------------------------------------------------
+#   8x8 matrix  live weather scene: horizon, sun with turning rays, wind
+#               streaks, falling rain that splashes on the ground row, and
+#               full-screen lightning. Your held keys mark the ground.
+#   NeoPixel    sky colour for the current weather (Rainbow cycles hue)
+#   Blue LED    barometer: breathes faster as the weather builds, and flares
+#               on every note, droplet and lightning strike
+# =============================================================================
 
 import time
 import math
 import random
+
 import board
 import busio
 import digitalio
 import usb_midi
 import neopixel
+
+try:
+    import pwmio
+except ImportError:
+    pwmio = None
+
 from adafruit_ht16k33.matrix import Matrix8x8
 
-# ── Hardware ──────────────────────────────────────────────────────────────────
+# ── Hardware ─────────────────────────────────────────────────────────────────
 
 PIN_MAP = {
     1: "GP26", 2: "GP21", 3: "GP20", 4: "GP19",
     5: "GP22", 6: "GP18", 7: "GP16", 8: "GP17",
 }
 
+SUN, WIND, RAIN = 1, 2, 3
+MODS = (SUN, WIND, RAIN)
+NOTE_KEYS = (4, 5, 6, 7, 8)
+
 i2c = busio.I2C(scl=board.GP1, sda=board.GP0, frequency=400000)
-mx  = Matrix8x8(i2c, address=0x70)
+mx = Matrix8x8(i2c, address=0x70)
+mx.auto_write = False          # batch a whole frame, then push it in one go
 mx.brightness = 0.3
+_mx_brightness = 0.3
 
-pixel = neopixel.NeoPixel(board.GP23, 1, brightness=0.15)
+pixel = neopixel.NeoPixel(board.GP23, 1, brightness=0.45, auto_write=False)
 
-try:
-    onboard_led = digitalio.DigitalInOut(board.LED)
-except AttributeError:
-    onboard_led = digitalio.DigitalInOut(board.GP25)
-onboard_led.direction = digitalio.Direction.OUTPUT
-onboard_led.value = False
+# Blue LED. PWM gives us a smooth barometer breath; fall back to on/off.
+_led_pin = getattr(board, "LED", None)
+if _led_pin is None:
+    _led_pin = board.GP25
+
+led_pwm = None
+led_dig = None
+if pwmio is not None:
+    try:
+        led_pwm = pwmio.PWMOut(_led_pin, frequency=1000, duty_cycle=0)
+    except Exception:
+        led_pwm = None
+if led_pwm is None:
+    led_dig = digitalio.DigitalInOut(_led_pin)
+    led_dig.direction = digitalio.Direction.OUTPUT
+    led_dig.value = False
+
+
+def set_led(level):
+    """level 0.0 - 1.0"""
+    lv = 0.0 if level < 0.0 else (1.0 if level > 1.0 else level)
+    if led_pwm is not None:
+        # square it so the fade reads linearly to the eye
+        led_pwm.duty_cycle = int(lv * lv * 65535)
+    else:
+        led_dig.value = lv > 0.4
+
 
 buttons = {}
 for _k, _p in PIN_MAP.items():
     _b = digitalio.DigitalInOut(getattr(board, _p))
     _b.direction = digitalio.Direction.INPUT
-    _b.pull      = digitalio.Pull.UP
-    buttons[_k]  = _b
+    _b.pull = digitalio.Pull.UP
+    buttons[_k] = _b
+
+# ── MIDI out (USB + DIN/UART) ────────────────────────────────────────────────
 
 usb_out = usb_midi.ports[1]
-uart    = busio.UART(tx=board.GP4, baudrate=31250)
+uart = busio.UART(tx=board.GP4, baudrate=31250)
 
-# ── MIDI Channel Helper ───────────────────────────────────────────────────────
+# Channel constants are 0-based nibbles; the comment is the 1-based channel
+# number you will see in your DAW or synth.
+CH_MAIN = 0     # MIDI channel 1
+CH_SUN = 1      # MIDI channel 2
+CH_RAIN = 2     # MIDI channel 3
+CH_WIND = 3     # MIDI channel 4
+CH_THUNDER = 4  # MIDI channel 5
+ALL_CH = (CH_MAIN, CH_SUN, CH_RAIN, CH_WIND, CH_THUNDER)
 
-def ch(v_idx):
-    """Convert 0-based voice index to 1-based MIDI channel."""
-    return v_idx + 1
 
-# ── Raw MIDI ──────────────────────────────────────────────────────────────────
+def _send(data):
+    usb_out.write(data)
+    uart.write(data)
 
-def raw_note_on(channel, note, vel=80):
-    b = bytes([0x90 | (channel & 0xF), note & 0x7F, vel & 0x7F])
-    usb_out.write(b)
-    uart.write(b)
 
-def raw_note_off(channel, note):
-    b = bytes([0x80 | (channel & 0xF), note & 0x7F, 0])
-    usb_out.write(b)
-    uart.write(b)
+def note_on(chan, note, vel=90):
+    n = 0 if note < 0 else (127 if note > 127 else int(note))
+    v = 1 if vel < 1 else (127 if vel > 127 else int(vel))
+    _send(bytes([0x90 | chan, n, v]))
 
-def raw_cc(channel, cc, val):
-    b = bytes([0xB0 | (channel & 0xF), cc & 0x7F, int(val) & 0x7F])
-    usb_out.write(b)
-    uart.write(b)
+
+def note_off(chan, note):
+    n = 0 if note < 0 else (127 if note > 127 else int(note))
+    _send(bytes([0x80 | chan, n, 0]))
+
+
+_cc_cache = {}
+
+
+def cc(chan, num, val, force=False):
+    v = 0 if val < 0 else (127 if val > 127 else int(val))
+    key = (chan << 8) | num
+    if not force and _cc_cache.get(key) == v:
+        return
+    _cc_cache[key] = v
+    _send(bytes([0xB0 | chan, num, v]))
+
+
+_bend_cache = {}
+
+
+def bend(chan, value):
+    """value 0 - 16383, 8192 = centre"""
+    v = 0 if value < 0 else (16383 if value > 16383 else int(value))
+    if abs(_bend_cache.get(chan, 8192) - v) < 24:
+        return
+    _bend_cache[chan] = v
+    _send(bytes([0xE0 | chan, v & 0x7F, (v >> 7) & 0x7F]))
+
 
 def midi_panic():
-    """Silence everything and reset controllers on channels 1–6."""
-    for _ch in range(1, 7):
-        raw_cc(_ch, 123, 0)   # all notes off
-        raw_cc(_ch,   7, 100) # volume back to default
-        raw_cc(_ch,  11, 0)   # expression to 0
-        raw_cc(_ch,   1, 0)   # mod wheel to 0
+    for c in ALL_CH:
+        cc(c, 123, 0, force=True)   # all notes off
+        cc(c, 120, 0, force=True)   # all sound off
+        cc(c, 1, 0, force=True)
+        cc(c, 7, 100, force=True)
+        cc(c, 10, 64, force=True)
+        cc(c, 74, 64, force=True)
+        cc(c, 91, 40, force=True)
+        _bend_cache[c] = -1
+        bend(c, 8192)
 
-# ── Music Theory ──────────────────────────────────────────────────────────────
+# ── Music ────────────────────────────────────────────────────────────────────
 
-DEFAULT_ROOT = 48  # C3
+# Five-note scales so all five white keys always map cleanly.
+SCALES = (
+    ("Clear",    (0, 2, 4, 7, 9)),    # major pentatonic
+    ("Overcast", (0, 3, 5, 7, 10)),   # minor pentatonic
+    ("Frost",    (0, 2, 3, 7, 9)),    # kumoi
+    ("Monsoon",  (0, 2, 3, 7, 8)),    # hirajoshi
+    ("Aurora",   (0, 2, 4, 6, 9)),    # lydian pentatonic
+    ("Drought",  (0, 1, 5, 7, 10)),   # in sen
+)
 
-SCALES = [
-    {"name": "Pentatonic", "notes": [0, 3,  5,  7, 10      ], "color": (255, 180,   0), "letter": "p"},
-    {"name": "Major",      "notes": [0, 2,  4,  5,  7, 9, 11], "color": (  0, 220,   0), "letter": "m"},
-    {"name": "Minor",      "notes": [0, 2,  3,  5,  7, 8, 10], "color": (200,  30,  30), "letter": "n"},
-    {"name": "Dorian",     "notes": [0, 2,  3,  5,  7, 9, 10], "color": (  0,  80, 255), "letter": "d"},
-    {"name": "Lydian",     "notes": [0, 2,  4,  6,  7, 9, 11], "color": (160,   0, 255), "letter": "l"},
-    {"name": "Mixolydian", "notes": [0, 2,  4,  5,  7, 9, 10], "color": (255, 120,   0), "letter": "x"},
-]
+OCTAVE_ROOTS = (36, 48, 60, 72)
+OCTAVE_NAMES = ("C2", "C3", "C4", "C5")
 
-GRAVITY_NAMES = ["Float", "Root Pull", "Cluster", "Spread"]
-GRAV_ICONS    = ["grav_float", "grav_root", "grav_cluster", "grav_spread"]
+RAIN_RATES = (("Drizzle", 0.42), ("Shower", 0.22), ("Downpour", 0.11))
 
-DRIFT_SPEEDS      = [45.0, 18.0, 7.0]
-DRIFT_SPEED_NAMES = ["Glacial", "Medium", "Restless"]
-DRIFT_ICONS       = ["spd_slow", "spd_mid", "spd_fast"]
+cfg = {"scale": 0, "octave": 1, "rain": 1}
 
-# Voice lifecycle timing (seconds)
-ATK_MIN,  ATK_MAX  = 3.0, 8.0   # attack ramp
-REL_MIN,  REL_MAX  = 5.0, 12.0  # normal release
-OUTRO_DUR          = 50.0        # outro release duration
-BREATHE_PEAK       = 14.0        # time to swell peak
-BREATHE_DUR        = 30.0        # total breathe cycle
-BREATHE_REV_DUR    = 9.0         # time to fade when reversed
+DEV = True   # set False to silence the serial log
 
-# Voice states
-SLEEPING  = 0
-WAKING    = 1
-ACTIVE    = 2
-RELEASING = 3
 
-# ── App State ─────────────────────────────────────────────────────────────────
+def log(*a):
+    if DEV:
+        print(*a)
 
-cfg = {
-    "root":        DEFAULT_ROOT,
-    "scale":       0,
-    "gravity":     0,
-    "drift_speed": 1,
-}
 
-def new_voice(i):
-    """Create a fresh sleeping voice for index i (0-5)."""
-    return {
-        "state":      SLEEPING,
-        "note":       None,
-        "degree":     i % 5,
-        "expr":       0.0,
-        "state_t":    0.0,
-        "atk":        ATK_MIN,
-        "rel":        REL_MIN,
-        "drift_next": 0.0,
-        "mod_ph":     random.uniform(0.0, 6.28),
-        "last_cc11":  -1,
-        "last_cc1":   -1,
-        "rel_start_expr": 1.0,
+def scale_note(degree, oct_shift=0):
+    steps = SCALES[cfg["scale"]][1]
+    octaves, idx = divmod(int(degree), len(steps))
+    n = OCTAVE_ROOTS[cfg["octave"]] + 12 * (octaves + oct_shift) + steps[idx]
+    return 0 if n < 0 else (127 if n > 127 else n)
+
+# ── State ────────────────────────────────────────────────────────────────────
+
+w_sun = False
+w_wind = False
+w_rain = False
+
+held = {}        # note key -> voice state
+pending = []     # [fire_time, kind, chan, note, vel]  kind 0=on 1=off
+PENDING_ON, PENDING_OFF = 0, 1
+
+gust = 0.0
+gust_target = 0.0
+gust_next = 0.0
+
+drops = []       # [x, y, vx, vy]   matrix rain particles
+risers = []      # [x, y]           motes rising from held notes
+splashes = []    # [x, until]
+amb_next = 0.0
+riser_next = 0.0
+lightning = []   # [(start, end), ...]
+thunder_ok_at = 0.0
+
+led_energy = 0.0
+pix_rgb = [8.0, 16.0, 40.0]
+pix_pulse = 0.0
+
+flash_rows = None
+flash_until = 0.0
+flash_rgb = None
+
+# Per-modifier press tracking, so a lone tap can mean "change a setting"
+# while a hold means "play the weather".
+mod_state = {m: {"down": False, "t": 0.0, "solo": False, "used": False}
+             for m in MODS}
+last_raw = {k: True for k in buttons}
+
+PAD_X = (0, 2, 3, 5, 7)   # matrix column for each of the five note keys
+
+# ── Scheduler ────────────────────────────────────────────────────────────────
+
+
+def schedule_on(t, chan, note, vel):
+    pending.append([t, PENDING_ON, chan, note, vel])
+
+
+def schedule_off(t, chan, note):
+    pending.append([t, PENDING_OFF, chan, note, 0])
+
+
+def cancel_pending_on(chan, note):
+    for i in range(len(pending) - 1, -1, -1):
+        p = pending[i]
+        if p[1] == PENDING_ON and p[2] == chan and p[3] == note:
+            pending.pop(i)
+
+
+def update_pending(now):
+    for i in range(len(pending) - 1, -1, -1):
+        p = pending[i]
+        if now >= p[0]:
+            if p[1] == PENDING_ON:
+                note_on(p[2], p[3], p[4])
+            else:
+                note_off(p[2], p[3])
+            pending.pop(i)
+
+# ── Weather engine ───────────────────────────────────────────────────────────
+
+
+def weather_name():
+    if w_sun and w_wind and w_rain:
+        return "Storm"
+    if w_wind and w_rain:
+        return "Squall"
+    if w_sun and w_rain:
+        return "Rainbow"
+    if w_sun and w_wind:
+        return "Heat Haze"
+    if w_rain:
+        return "Rain"
+    if w_wind:
+        return "Breeze"
+    if w_sun:
+        return "Sunshine"
+    return "Clear"
+
+
+def spawn_drop(x, fast):
+    if len(drops) > 26:
+        return
+    vy = (0.55 if not fast else 1.15) + random.uniform(0.0, 0.35)
+    vx = (gust * random.uniform(0.25, 0.6)) if w_wind else 0.0
+    drops.append([float(x), random.uniform(0.0, 0.9), vx, vy])
+
+
+def strike_thunder(now):
+    """A low hit plus a double lightning flash."""
+    global thunder_ok_at, led_energy
+    if now < thunder_ok_at:
+        return
+    thunder_ok_at = now + 2.2
+    root = OCTAVE_ROOTS[cfg["octave"]] - 24
+    n = scale_note(random.choice((0, 0, 4)), 0) - 24
+    if n < 12:
+        n = root if root >= 12 else 24
+    note_on(CH_THUNDER, n, random.randint(105, 127))
+    schedule_off(now + random.uniform(1.1, 1.9), CH_THUNDER, n)
+    lightning.append((now, now + 0.07))
+    lightning.append((now + 0.15, now + 0.24))
+    led_energy = 1.0
+    log("thunder", n)
+
+
+def droplet(key, st, now):
+    """One rain droplet from a held key. Shape depends on the other elements."""
+    global led_energy
+    i = st["drop_i"]
+
+    if w_sun:
+        # Rainbow: droplets climb, bright and airy.
+        deg = st["deg"] + 2 + i
+        osh = 1
+        vel = int(min(120, 74 + i * 4) * random.uniform(0.85, 1.0))
+        dur = 0.34
+    elif w_wind:
+        # Squall: scattered wide, thrown around.
+        deg = st["deg"] + random.randint(-4, 5)
+        osh = random.choice((-1, 0, 0, 1))
+        vel = int(random.uniform(0.55, 1.0) * 118)
+        dur = 0.16
+    else:
+        # Plain rain: a trickle down the scale, fading.
+        deg = st["deg"] - i
+        osh = 0
+        vel = int(max(38, 104 - i * 8) * random.uniform(0.8, 1.0))
+        dur = 0.30
+
+    n = scale_note(deg, osh)
+    note_on(CH_RAIN, n, vel)
+    schedule_off(now + dur, CH_RAIN, n)
+    spawn_drop(PAD_X[deg % 5], cfg["rain"] == 2 or w_wind)
+    led_energy = max(led_energy, 0.45)
+
+    if w_wind and w_rain and random.random() < (0.09 if w_sun else 0.05):
+        strike_thunder(now)
+
+    st["drop_i"] = (i + 1) % 10
+    rate = RAIN_RATES[cfg["rain"]][1]
+    jitter = 0.55 if w_wind else 0.22
+    st["drop_next"] = now + rate * random.uniform(1.0 - jitter, 1.0 + jitter)
+
+
+def spawn_wind_voice(st, now):
+    n = scale_note(st["deg"] + 3, 1)
+    note_on(CH_WIND, n, 68)
+    st["wind"] = n
+    st["wind_next"] = now + random.uniform(0.6, 1.6)
+
+
+def kill_wind_voice(st):
+    if st["wind"] is not None:
+        note_off(CH_WIND, st["wind"])
+        st["wind"] = None
+
+
+def press_note(key, now):
+    global led_energy, pix_pulse
+    deg = NOTE_KEYS.index(key)
+    n = scale_note(deg, 1 if w_sun else 0)
+    note_on(CH_MAIN, n, 112 if w_sun else 96)
+
+    st = {
+        "deg": deg,
+        "main": n,
+        "sun": [],
+        "wind": None,
+        "wind_next": 0.0,
+        "drop_next": (now if w_rain else None),
+        "drop_i": 0,
     }
 
-voices = [new_voice(i) for i in range(6)]
+    if w_sun:
+        # Chord blooms upward, voices staggered so it shimmers in.
+        for k, (off, delay) in enumerate(((2, 0.05), (4, 0.13))):
+            hn = scale_note(deg + off, 1)
+            schedule_on(now + delay, CH_SUN, hn, 92 - k * 12)
+            st["sun"].append(hn)
 
-# Neopixel
-pix_ph = 0.0
+    if w_wind:
+        spawn_wind_voice(st, now)
 
-# Breathe
-breathe_on    = False
-breathe_t0    = 0.0
-breathe_rev   = False
-breathe_rev_t = 0.0
-breathe_cc7   = [100] * 6
+    held[key] = st
+    led_energy = 1.0
+    pix_pulse = 1.0
 
-# Scatter flash
-scatter_flash_until = 0.0
 
-# Non-blocking matrix flash
-flash_bitmap = None
-flash_until  = 0.0
+def release_note(key):
+    st = held.pop(key, None)
+    if st is None:
+        return
+    note_off(CH_MAIN, st["main"])
+    for hn in st["sun"]:
+        cancel_pending_on(CH_SUN, hn)
+        note_off(CH_SUN, hn)
+    kill_wind_voice(st)
 
-# Input state
-shift_on   = False
-shift_used = False
-btn8_t     = None
-last_btn   = {k: True for k in buttons}
 
-# ── 8×8 Bitmaps ───────────────────────────────────────────────────────────────
+def update_held(now):
+    """Modifiers act live: pick one up mid-note and the held note responds."""
+    for key in list(held.keys()):
+        st = held.get(key)
+        if st is None:
+            continue
 
-BITMAPS = {
-    "p": [0x3C, 0x42, 0x42, 0x7C, 0x40, 0x40, 0x40, 0x40],
-    "m": [0x42, 0x66, 0x5A, 0x42, 0x42, 0x42, 0x42, 0x42],
-    "n": [0x42, 0x62, 0x52, 0x4A, 0x46, 0x42, 0x42, 0x42],
-    "d": [0x7C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7C],
-    "l": [0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7E],
-    "x": [0x42, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x42],
+        # Wind companion voice
+        if w_wind:
+            if st["wind"] is None:
+                spawn_wind_voice(st, now)
+            elif now >= st["wind_next"]:
+                nn = scale_note(st["deg"] + random.choice((2, 3, 4, 5, 7)), 1)
+                if nn != st["wind"]:
+                    note_on(CH_WIND, nn, int(52 + gust * 48))
+                    note_off(CH_WIND, st["wind"])
+                    st["wind"] = nn
+                st["wind_next"] = now + random.uniform(0.3, 1.3) / (0.5 + gust)
+        elif st["wind"] is not None:
+            kill_wind_voice(st)
 
-    "grav_float":   [0x00, 0x18, 0x3C, 0x66, 0x66, 0x3C, 0x18, 0x00],
-    "grav_root":    [0x00, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x00],
-    "grav_cluster": [0x00, 0x3C, 0x7E, 0xFF, 0xFF, 0x7E, 0x3C, 0x00],
-    "grav_spread":  [0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81],
+        # Rain droplets
+        if w_rain:
+            if st["drop_next"] is None:
+                st["drop_next"] = now
+                st["drop_i"] = 0
+            elif now >= st["drop_next"]:
+                droplet(key, st, now)
+        elif st["drop_next"] is not None:
+            st["drop_next"] = None
 
-    "spd_slow":     [0x00, 0x00, 0x00, 0x7E, 0x7E, 0x00, 0x00, 0x00],
-    "spd_mid":      [0x00, 0x18, 0x3C, 0xFF, 0xFF, 0x3C, 0x18, 0x00],
-    "spd_fast":     [0xFF, 0xBD, 0xFF, 0x24, 0x24, 0xFF, 0xBD, 0xFF],
 
-    "oct_down":     [0x00, 0x18, 0x3C, 0x7E, 0x18, 0x18, 0x18, 0x00],
-    "oct_up":       [0x00, 0x18, 0x18, 0x18, 0x7E, 0x3C, 0x18, 0x00],
+def update_wind(now):
+    """Gusts drive pitch bend, mod wheel and pan — and the matrix streaks."""
+    global gust, gust_target, gust_next
 
-    "scatter":      [0x42, 0x24, 0x99, 0x3C, 0x3C, 0x99, 0x24, 0x42],
-    "release_all":  [0x00, 0x3C, 0x42, 0x81, 0x81, 0x42, 0x3C, 0x00],
-    "panic":        [0xFF, 0x81, 0xBD, 0xA5, 0xA5, 0xBD, 0x81, 0xFF],
-    "breathe":      [0x18, 0x24, 0x42, 0x81, 0x81, 0x42, 0x24, 0x18],
-}
-
-def flash(key, dur=0.7):
-    """Queue a non-blocking matrix flash (letter or icon)."""
-    global flash_bitmap, flash_until
-    data = BITMAPS.get(key)
-    if data:
-        flash_bitmap = data
-        flash_until  = time.monotonic() + dur
-
-# ── Throttled CC Helpers ──────────────────────────────────────────────────────
-
-CC_THRESHOLD = 2
-
-def send_cc11(v, v_idx):
-    val = int(v["expr"] * 127)
-    if abs(val - v["last_cc11"]) >= CC_THRESHOLD or v["last_cc11"] < 0:
-        raw_cc(ch(v_idx), 11, val)
-        v["last_cc11"] = val
-
-def send_cc1(v, v_idx, val):
-    if abs(val - v["last_cc1"]) >= CC_THRESHOLD or v["last_cc1"] < 0:
-        raw_cc(ch(v_idx), 1, val)
-        v["last_cc1"] = val
-
-# ── Note Helpers ──────────────────────────────────────────────────────────────
-
-def get_note(v_idx, degree):
-    sc   = SCALES[cfg["scale"]]["notes"]
-    note = cfg["root"] + sc[degree % len(sc)]
-    note += 12 if v_idx >= 3 else 0
-    return min(127, note)
-
-def next_degree(v_idx):
-    g    = cfg["gravity"]
-    sc   = SCALES[cfg["scale"]]["notes"]
-    s    = len(sc)
-    cur  = voices[v_idx]["degree"]
-
-    if g == 0:
-        step = random.choice([-2, -1, -1, 1, 1, 2])
-        return max(0, min(s - 1, cur + step))
-
-    elif g == 1:
-        fifth = min(s - 1, 4)
-        pool  = [0, 0, 0, fifth, fifth, max(0, cur - 1), min(s - 1, cur + 1)]
-        return random.choice(pool)
-
-    elif g == 2:
-        others = [voices[j]["degree"] for j in range(6)
-                  if j != v_idx and voices[j]["state"] in (WAKING, ACTIVE)]
-        if others:
-            avg  = sum(others) / len(others)
-            step = 1 if avg > cur else (-1 if avg < cur else random.choice([-1, 1]))
-        else:
-            step = random.choice([-1, 1])
-        return max(0, min(s - 1, cur + step))
-
+    if w_wind:
+        if now >= gust_next:
+            gust_target = random.uniform(0.08, 1.0)
+            gust_next = now + random.uniform(0.7, 2.6)
+        gust += (gust_target - gust) * 0.035
     else:
-        others = [voices[j]["degree"] for j in range(6)
-                  if j != v_idx and voices[j]["state"] in (WAKING, ACTIVE)]
-        if others:
-            avg  = sum(others) / len(others)
-            step = -1 if avg > cur else (1 if avg < cur else random.choice([-1, 1]))
-        else:
-            step = random.choice([-1, 1])
-        return max(0, min(s - 1, cur + step))
+        gust += (0.0 - gust) * 0.06
+        if gust < 0.005:
+            gust = 0.0
 
-# ── Voice Control ─────────────────────────────────────────────────────────────
+    depth = 1500 if w_sun else 850     # heat haze bends further
+    wob = math.sin(now * 2.3) * 0.62 + math.sin(now * 0.71) * 0.38
+    b = 8192 + int(gust * depth * wob)
+    for c in (CH_MAIN, CH_SUN, CH_WIND):
+        bend(c, b)
 
-def wake(v_idx, now):
-    v    = voices[v_idx]
-    note = get_note(v_idx, v["degree"])
-    raw_cc(ch(v_idx), 11, 0)
-    raw_cc(ch(v_idx),  7, 100)
-    raw_note_on(ch(v_idx), note, 80)
-    v["state"]      = WAKING
-    v["note"]       = note
-    v["expr"]       = 0.0
-    v["last_cc11"]  = 0
-    v["last_cc1"]   = -1
-    v["state_t"]    = now
-    v["atk"]        = random.uniform(ATK_MIN, ATK_MAX)
-    spd             = DRIFT_SPEEDS[cfg["drift_speed"]]
-    v["drift_next"] = now + random.uniform(spd * 0.8, spd * 1.2)
-    print(f"Voice {v_idx + 1} → WAKING  ch={ch(v_idx)}  note={note}")
+    cc(CH_MAIN, 1, int(gust * 70))
+    cc(CH_WIND, 1, int(gust * 110))
+    cc(CH_WIND, 10, int(64 + math.sin(now * 0.9) * gust * 60))
 
-def begin_release(v_idx, now, dur=None):
-    v = voices[v_idx]
-    if v["state"] == SLEEPING:
-        return
-    v["state"]          = RELEASING
-    v["state_t"]        = now
-    v["rel"]            = dur if dur is not None else random.uniform(REL_MIN, REL_MAX)
-    v["rel_start_expr"] = v["expr"]
-    print(f"Voice {v_idx + 1} → RELEASING  ch={ch(v_idx)}  dur={v['rel']:.1f}s")
 
-def toggle(v_idx, now):
-    v = voices[v_idx]
-    if v["state"] == SLEEPING:
-        wake(v_idx, now)
-    elif v["state"] in (WAKING, ACTIVE):
-        begin_release(v_idx, now)
+def update_timbre():
+    """Sun opens the filter, rain wets the reverb."""
+    bright = 96 if w_sun else 58
+    wet = 88 if w_rain else 34
+    for c in (CH_MAIN, CH_SUN):
+        cc(c, 74, bright)
+    for c in (CH_MAIN, CH_RAIN):
+        cc(c, 91, wet)
 
-def drift(v_idx, now):
-    v        = voices[v_idx]
-    new_deg  = next_degree(v_idx)
-    new_note = get_note(v_idx, new_deg)
-    if new_note != v["note"]:
-        raw_note_on(ch(v_idx), new_note, 80)
-        if v["note"] is not None:
-            raw_note_off(ch(v_idx), v["note"])
-        v["note"]   = new_note
-        v["degree"] = new_deg
-        print(f"Voice {v_idx + 1} drifted → ch={ch(v_idx)}  note={new_note}")
-    spd             = DRIFT_SPEEDS[cfg["drift_speed"]]
-    v["drift_next"] = now + random.uniform(spd * 0.7, spd * 1.3)
+# ── Matrix graphics ──────────────────────────────────────────────────────────
+#
+# Drawing is done in LOGICAL coordinates: x = 0 is the left column, y = 0 is
+# the top row, as the panel reads when the box is in front of you. The panel
+# is mounted turned, so ROTATE is applied once, at blit time. Change ROTATE
+# (0 / 90 / 180 / 270) if the scene comes out sideways — never the artwork.
 
-def do_scatter(now):
-    global scatter_flash_until
-    sc = SCALES[cfg["scale"]]["notes"]
-    for i, v in enumerate(voices):
-        if v["state"] in (WAKING, ACTIVE):
-            nd = random.randint(0, len(sc) - 1)
-            nn = get_note(i, nd)
-            if nn != v["note"]:
-                raw_note_on(ch(i), nn, 80)
-                if v["note"] is not None:
-                    raw_note_off(ch(i), v["note"])
-                v["note"]   = nn
-                v["degree"] = nd
-    scatter_flash_until = now + 0.2
-    flash("scatter", 0.5)
-    print("Scatter!")
+ROTATE = 180
 
-def rekey_active_voices():
-    for i, v in enumerate(voices):
-        if v["state"] in (WAKING, ACTIVE):
-            new_note = get_note(i, v["degree"])
-            if new_note != v["note"]:
-                raw_note_on(ch(i), new_note, 80)
-                if v["note"] is not None:
-                    raw_note_off(ch(i), v["note"])
-                v["note"] = new_note
 
-# ── Envelope Updates ──────────────────────────────────────────────────────────
+def px(frame, x, y):
+    if 0 <= x < 8 and 0 <= y < 8:
+        frame[y] |= 1 << x
 
-def update_voices(now):
-    for i, v in enumerate(voices):
 
-        if v["state"] == WAKING:
-            t = min(1.0, (now - v["state_t"]) / v["atk"])
-            v["expr"] = t
-            send_cc11(v, i)
-            if t >= 1.0:
-                v["state"]   = ACTIVE
-                v["state_t"] = now
-                print(f"Voice {i + 1} → ACTIVE  ch={ch(i)}")
-
-        elif v["state"] == ACTIVE:
-            v["mod_ph"] = (v["mod_ph"] + 0.003) % 6.28
-            mod_val = int((math.sin(v["mod_ph"]) * 0.5 + 0.5) * 35)
-            send_cc1(v, i, mod_val)
-            if now >= v["drift_next"]:
-                drift(i, now)
-
-        elif v["state"] == RELEASING:
-            t = max(0.0, 1.0 - (now - v["state_t"]) / v["rel"])
-            v["expr"] = v["rel_start_expr"] * t
-            send_cc11(v, i)
-            if t <= 0.0:
-                if v["note"] is not None:
-                    raw_note_off(ch(i), v["note"])
-                raw_cc(ch(i), 1, 0)
-                v["last_cc1"]  = 0
-                v["last_cc11"] = 0
-                v["state"] = SLEEPING
-                v["note"]  = None
-                v["expr"]  = 0.0
-                print(f"Voice {i + 1} → SLEEPING  ch={ch(i)}")
-
-# ── Breathe ───────────────────────────────────────────────────────────────────
-
-def update_breathe(now):
-    global breathe_on, breathe_cc7
-
-    if not breathe_on:
-        return
-
-    elapsed = now - breathe_t0
-
-    if breathe_rev:
-        rev_elapsed = now - breathe_rev_t
-        mult = max(0.0, 1.0 - rev_elapsed / BREATHE_REV_DUR)
-        if mult <= 0.0:
-            breathe_on = False
-            for _i in range(6):
-                if voices[_i]["state"] != SLEEPING:
-                    raw_cc(ch(_i), 7, 100)
-                    breathe_cc7[_i] = 100
-            return
-    else:
-        if elapsed < BREATHE_PEAK:
-            mult = elapsed / BREATHE_PEAK
-        elif elapsed < BREATHE_DUR:
-            mult = 1.0 - (elapsed - BREATHE_PEAK) / (BREATHE_DUR - BREATHE_PEAK)
-        else:
-            breathe_on = False
-            for _i in range(6):
-                if voices[_i]["state"] != SLEEPING:
-                    raw_cc(ch(_i), 7, 100)
-                    breathe_cc7[_i] = 100
-            return
-
-    vol = int(80 + mult * 47)
-    for i, v in enumerate(voices):
-        if v["state"] != SLEEPING:
-            if abs(vol - breathe_cc7[i]) >= 2:
-                raw_cc(ch(i), 7, vol)
-                breathe_cc7[i] = vol
-
-# ── Matrix Display ────────────────────────────────────────────────────────────
-
-_last_mx_t   = 0.0
-MATRIX_RATE  = 0.08
-
-def render_matrix(now):
-    global _last_mx_t, flash_bitmap, flash_until
-
-    if now - _last_mx_t < MATRIX_RATE:
-        return
-    _last_mx_t = now
-
+def blit(frame):
     mx.fill(0)
-
-    if flash_bitmap is not None and now < flash_until:
-        for row_i, byte_v in enumerate(flash_bitmap):
-            for col_i in range(8):
-                if (byte_v >> (7 - col_i)) & 1:
-                    mx[7 - col_i, 7 - row_i] = 1
-        mx.show()
-        return
-    else:
-        flash_bitmap = None
-
-    sc_len = len(SCALES[cfg["scale"]]["notes"])
-    for i, v in enumerate(voices):
-        if v["state"] == SLEEPING:
+    for y in range(8):
+        row = frame[y]
+        if not row:
             continue
-        if v["state"] == RELEASING and int(now * 6) % 2 == 0:
-            continue
-
-        col = i + 1
-        row = int(v["degree"] / max(1, sc_len - 1) * 6)
-        mx[7 - col, 7 - row] = 1
-
+        for x in range(8):
+            if (row >> x) & 1:
+                if ROTATE == 0:
+                    mx[x, y] = 1
+                elif ROTATE == 90:
+                    mx[y, 7 - x] = 1
+                elif ROTATE == 180:
+                    mx[7 - x, 7 - y] = 1
+                else:
+                    mx[7 - y, x] = 1
     mx.show()
 
-# ── Neopixel ──────────────────────────────────────────────────────────────────
+
+def set_matrix_brightness(v):
+    global _mx_brightness
+    v = 0.05 if v < 0.05 else (1.0 if v > 1.0 else v)
+    if abs(v - _mx_brightness) > 0.04:
+        _mx_brightness = v
+        mx.brightness = v
+
+
+# Scene layers ---------------------------------------------------------------
+
+wind_streaks = [[1, 0.0, 1.3], [3, 4.0, 0.85], [5, 8.0, 1.7]]  # y, x, speed
+
+
+def draw_calm(frame, now):
+    """Nothing held: a slow horizon swell and a couple of faint stars."""
+    for x in range(8):
+        y = 6 + int(round(math.sin(x * 0.85 + now * 0.7)))
+        px(frame, x, 4 if y < 4 else (7 if y > 7 else y))
+    if int(now * 1.7) % 3 == 0:
+        px(frame, 1, 1)
+    if int(now * 1.1) % 4 == 0:
+        px(frame, 6, 2)
+
+
+def draw_sun(frame, now):
+    """A 2x2 core with eight rays turning around it and breathing in and out."""
+    for dx in (0, 1):
+        for dy in (0, 1):
+            px(frame, 3 + dx, 2 + dy)
+    r = 2.3 + 0.55 * math.sin(now * 2.0)
+    phase = now * 1.1
+    for k in range(8):
+        a = phase + k * 0.7854
+        px(frame,
+           int(round(3.5 + math.cos(a) * r)),
+           int(round(2.5 + math.sin(a) * r)))
+
+
+def draw_wind(frame):
+    for s in wind_streaks:
+        s[1] = (s[1] + s[2] * (0.30 + gust * 1.5)) % 13.0
+        x = int(s[1]) - 3
+        for k in range(3):
+            px(frame, x + k, s[0])
+
+
+AMBIENT_RAIN = (0.30, 0.16, 0.08)   # spawn interval per rain rate
+
+
+def update_particles(now):
+    """Rain falls whenever RAIN is held, played or not — the display shows
+    the weather you are holding, not only the notes you play."""
+    global amb_next, riser_next
+
+    if w_rain:
+        if now >= amb_next:
+            gap = AMBIENT_RAIN[cfg["rain"]]
+            amb_next = now + gap * random.uniform(0.5, 1.5)
+            spawn_drop(random.randint(0, 7), cfg["rain"] == 2 or w_wind)
+    else:
+        amb_next = now
+
+    # Held notes send motes up when it is not raining, so plain Clear
+    # weather still has something to watch.
+    if held and not w_rain and now >= riser_next:
+        riser_next = now + 0.30
+        for st in held.values():
+            if len(risers) < 16:
+                risers.append([float(PAD_X[st["deg"]]), 6.5])
+
+    for i in range(len(drops) - 1, -1, -1):
+        d = drops[i]
+        d[1] += d[3]
+        d[0] += d[2]
+        if d[0] < -1 or d[0] > 8 or d[1] >= 7.0:
+            if 0 <= d[0] < 8 and len(splashes) < 12:
+                splashes.append([int(d[0]), now + 0.16])
+            drops.pop(i)
+
+    for i in range(len(risers) - 1, -1, -1):
+        r = risers[i]
+        r[1] -= 0.55
+        r[0] += gust * 0.22
+        if r[1] < 0.0 or r[0] < -1 or r[0] > 8:
+            risers.pop(i)
+
+    for i in range(len(splashes) - 1, -1, -1):
+        if now >= splashes[i][1]:
+            splashes.pop(i)
+
+
+def draw_particles(frame):
+    for d in drops:
+        px(frame, int(d[0]), int(d[1]))
+    for r in risers:
+        px(frame, int(r[0]), int(r[1]))
+    for s in splashes:
+        px(frame, s[0] - 1, 6)
+        px(frame, s[0] + 1, 6)
+
+
+def draw_ground(frame):
+    for key, st in held.items():
+        px(frame, PAD_X[st["deg"]], 7)
+
+
+# Setting-change glyphs ------------------------------------------------------
+
+def show_flash(rows, rgb, dur=0.7):
+    global flash_rows, flash_until, flash_rgb
+    flash_rows = rows
+    flash_until = time.monotonic() + dur
+    flash_rgb = rgb
+
+
+def bars_v(n):
+    """n filled columns from the left — used for the scale number."""
+    mask = 0
+    for i in range(n):
+        mask |= 1 << i
+    return [mask] * 8
+
+
+def bars_h(n):
+    """n filled rows from the bottom — used for the octave number."""
+    rows = [0] * 8
+    for i in range(n):
+        rows[7 - i] = 0xFF
+    return rows
+
+
+def dashes(n):
+    """n dashed rows — used for the rain rate."""
+    rows = [0] * 8
+    for i in range(n):
+        rows[1 + i * 2] = 0x55
+    return rows
+
+
+GLYPH_PANIC = [0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81]
+
+
+def render_matrix(now):
+    frame = [0] * 8
+
+    lit = False
+    for (a, b) in lightning:
+        if a <= now < b:
+            lit = True
+            break
+
+    if flash_rows is not None and now < flash_until:
+        frame = list(flash_rows)
+        set_matrix_brightness(0.55)
+    elif lit:
+        frame = [0xFF] * 8
+        set_matrix_brightness(1.0)
+    else:
+        set_matrix_brightness(0.5 if w_sun else 0.3)
+        if not (w_sun or w_wind or w_rain):
+            draw_calm(frame, now)
+        if w_sun:
+            draw_sun(frame, now)
+        if w_wind:
+            draw_wind(frame)
+        if drops or risers or splashes:
+            draw_particles(frame)
+        draw_ground(frame)
+
+    blit(frame)
+
+# ── NeoPixel: the sky ────────────────────────────────────────────────────────
+
+SKY = {
+    (False, False, False): (14, 34, 78),     # clear night blue
+    (True,  False, False): (255, 168, 26),   # sunshine gold
+    (False, True,  False): (26, 200, 168),   # breeze teal
+    (False, False, True):  (18, 68, 210),    # rain blue
+    (True,  True,  False): (255, 92, 40),    # heat haze orange-red
+    (False, True,  True):  (48, 54, 150),    # squall slate blue
+    (True,  True,  True):  (150, 28, 205),   # storm violet
+    # (True, False, True) — Rainbow — is generated, see sky_target()
+}
+
+
+def hsv(h):
+    """h 0.0-1.0 -> full-saturation rgb tuple"""
+    i = int(h * 6.0) % 6
+    f = h * 6.0 - int(h * 6.0)
+    p, q, t = 0.0, 1.0 - f, f
+    if i == 0:
+        r, g, b = 1.0, t, p
+    elif i == 1:
+        r, g, b = q, 1.0, p
+    elif i == 2:
+        r, g, b = p, 1.0, t
+    elif i == 3:
+        r, g, b = p, q, 1.0
+    elif i == 4:
+        r, g, b = t, p, 1.0
+    else:
+        r, g, b = 1.0, p, q
+    return (r * 255, g * 255, b * 255)
+
+
+def sky_target(now):
+    if w_sun and w_rain and not w_wind:
+        return hsv((now * 0.14) % 1.0)          # Rainbow: hue keeps turning
+    return SKY[(w_sun, w_wind, w_rain)]
+
 
 def update_pixel(now):
-    global pix_ph
+    global pix_pulse
 
-    if shift_on:
-        pixel[0] = (180, 180, 180)
-        return
+    lit = False
+    for (a, b) in lightning:
+        if a <= now < b:
+            lit = True
+            break
 
-    if now < scatter_flash_until:
+    if lit:
         pixel[0] = (255, 255, 255)
+        pixel.show()
         return
 
-    sc_col   = SCALES[cfg["scale"]]["color"]
-    active_n = sum(1 for v in voices if v["state"] != SLEEPING)
+    if flash_rgb is not None and now < flash_until:
+        pixel[0] = flash_rgb
+        pixel.show()
+        return
 
-    breathe_glow = 0.0
-    if breathe_on:
-        elapsed = now - breathe_t0
-        if not breathe_rev:
-            if elapsed < BREATHE_PEAK:
-                breathe_glow = (elapsed / BREATHE_PEAK) * 0.45
-            elif elapsed < BREATHE_DUR:
-                breathe_glow = max(0.0, 0.45 - (elapsed - BREATHE_PEAK) /
-                                   (BREATHE_DUR - BREATHE_PEAK) * 0.45)
+    tgt = sky_target(now)
+    for i in range(3):
+        pix_rgb[i] += (tgt[i] - pix_rgb[i]) * 0.09   # weather changes, not cuts
 
-    pix_ph = (pix_ph + 0.004) % 6.28
-    pulse  = 0.85 + 0.15 * math.sin(pix_ph)
+    pix_pulse *= 0.88
+    breath = 0.80 + 0.14 * math.sin(now * 1.4) + pix_pulse * 0.55
+    if breath > 1.6:
+        breath = 1.6
 
-    base = (0.06 + (active_n / 6.0) * 0.94) * pulse * (1.0 + breathe_glow)
-    base = min(1.0, base)
+    pixel[0] = (min(255, int(pix_rgb[0] * breath)),
+                min(255, int(pix_rgb[1] * breath)),
+                min(255, int(pix_rgb[2] * breath)))
+    pixel.show()
 
-    pixel[0] = (int(sc_col[0] * base), int(sc_col[1] * base), int(sc_col[2] * base))
+# ── Blue LED: the barometer ──────────────────────────────────────────────────
 
-# ── Onboard LED ───────────────────────────────────────────────────────────────
 
-def update_onboard_led():
-    onboard_led.value = any(v["state"] != SLEEPING for v in voices)
+def update_blue_led(now):
+    global led_energy
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+    for (a, b) in lightning:
+        if a <= now < b:
+            set_led(1.0)
+            return
 
-for _ch in range(1, 7):
-    raw_cc(_ch, 7, 100)
+    intensity = (1 if w_sun else 0) + (1 if w_wind else 0) + (1 if w_rain else 0)
+    rate = 0.55 + intensity * 0.85          # builds as the weather builds
+    depth = 0.06 + intensity * 0.05
+    breath = 0.07 + depth * (0.5 + 0.5 * math.sin(now * rate * 2.0))
 
-print("─" * 50)
-print("Tidal — Ambient Voice Field")
-print(f"Scale:   {SCALES[cfg['scale']]['name']}")
-print(f"Gravity: {GRAVITY_NAMES[cfg['gravity']]}")
-print(f"Drift:   {DRIFT_SPEED_NAMES[cfg['drift_speed']]}")
-print(f"Root:    {cfg['root']}")
-print("MIDI channels: 1–6 (one per voice)")
-print("─" * 50)
+    led_energy *= 0.90
+    if led_energy < 0.01:
+        led_energy = 0.0
 
-# ── Main Loop ─────────────────────────────────────────────────────────────────
+    set_led(breath + led_energy)
+
+# ── Settings & panic ─────────────────────────────────────────────────────────
+
+
+def cycle_setting(m):
+    if m == SUN:
+        cfg["scale"] = (cfg["scale"] + 1) % len(SCALES)
+        show_flash(bars_v(cfg["scale"] + 1), (0, 255, 90))
+        log("Scale  ->", SCALES[cfg["scale"]][0])
+    elif m == WIND:
+        cfg["octave"] = (cfg["octave"] + 1) % len(OCTAVE_ROOTS)
+        show_flash(bars_h(cfg["octave"] + 1), (255, 170, 0))
+        log("Octave ->", OCTAVE_NAMES[cfg["octave"]])
+    else:
+        cfg["rain"] = (cfg["rain"] + 1) % len(RAIN_RATES)
+        show_flash(dashes(cfg["rain"] + 1), (0, 120, 255))
+        log("Rain   ->", RAIN_RATES[cfg["rain"]][0])
+
+
+def do_panic():
+    global gust, gust_target, led_energy
+    for key in list(held.keys()):
+        release_note(key)
+    del pending[:]
+    del drops[:]
+    del risers[:]
+    del splashes[:]
+    del lightning[:]
+    midi_panic()
+    gust = 0.0
+    gust_target = 0.0
+    led_energy = 0.0
+    show_flash(GLYPH_PANIC, (255, 0, 0), 0.9)
+    log("PANIC - all notes off, clear skies")
+
+# ── Input ────────────────────────────────────────────────────────────────────
+
+
+panic_armed = True
+
+
+def scan_inputs(now):
+    global w_sun, w_wind, w_rain, panic_armed
+
+    # Note keys first: a note played during a modifier hold cancels that
+    # modifier's tap-to-change action.
+    for k in NOTE_KEYS:
+        v = buttons[k].value
+        if v != last_raw[k]:
+            last_raw[k] = v
+            if not v:
+                for m in MODS:
+                    if mod_state[m]["down"]:
+                        mod_state[m]["used"] = True
+                press_note(k, now)
+            else:
+                release_note(k)
+
+    for m in MODS:
+        v = buttons[m].value
+        ms = mod_state[m]
+        if v != last_raw[m]:
+            last_raw[m] = v
+            if not v:
+                others = [o for o in MODS if o != m and mod_state[o]["down"]]
+                ms["down"] = True
+                ms["t"] = now
+                ms["used"] = bool(held)
+                ms["solo"] = not others
+                for o in others:
+                    mod_state[o]["solo"] = False
+            else:
+                ms["down"] = False
+                if (ms["solo"] and not ms["used"]
+                        and not held and (now - ms["t"]) < 0.7):
+                    cycle_setting(m)
+
+    w_sun = mod_state[SUN]["down"]
+    w_wind = mod_state[WIND]["down"]
+    w_rain = mod_state[RAIN]["down"]
+
+    # All three held, nothing played -> panic
+    if w_sun and w_wind and w_rain:
+        if (panic_armed and not held
+                and not any(mod_state[m]["used"] for m in MODS)
+                and now - max(mod_state[m]["t"] for m in MODS) > 1.2):
+            panic_armed = False
+            do_panic()
+    elif not (w_sun or w_wind or w_rain):
+        panic_armed = True
+
+# ── Boot ─────────────────────────────────────────────────────────────────────
+
+
+def boot_animation():
+    """A sunrise, so you know the box is awake."""
+    t0 = time.monotonic()
+    while True:
+        t = time.monotonic() - t0
+        if t > 1.5:
+            break
+        frame = [0] * 8
+        cy = 9.0 - t * 5.0
+        for dx in (0, 1):
+            for dy in (0, 1):
+                px(frame, 3 + dx, int(cy) + dy)
+        if t > 0.7:
+            r = 2.4
+            for k in range(8):
+                a = t * 4.0 + k * 0.7854
+                px(frame,
+                   int(round(3.5 + math.cos(a) * r)),
+                   int(round(cy + 0.5 + math.sin(a) * r)))
+        px(frame, 0, 7)
+        px(frame, 2, 7)
+        px(frame, 3, 7)
+        px(frame, 5, 7)
+        px(frame, 7, 7)
+        blit(frame)
+        k = t / 1.5
+        pixel[0] = (int(14 + 240 * k), int(34 + 134 * k), int(78 - 52 * k))
+        pixel.show()
+        set_led(k * 0.5)
+        time.sleep(0.03)
+    set_led(0.0)
+
+
+midi_panic()
+boot_animation()
+
+print("-" * 58)
+print("Wolfpunk Weather Station")
+print("  1 SUN   2 WIND   3 RAIN      (hold with the left hand)")
+print("  4 - 8   notes                (play with the right hand)")
+print("  tap a lone modifier to cycle scale / octave / rain rate")
+print("  hold all three for 1.2s to panic")
+print("  MIDI ch 1 main  2 sun  3 rain  4 wind  5 thunder")
+print("  Scale {}   Octave {}   Rain {}".format(
+    SCALES[cfg["scale"]][0], OCTAVE_NAMES[cfg["octave"]],
+    RAIN_RATES[cfg["rain"]][0]))
+print("-" * 58)
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+
+t_gfx = 0.0
+t_ctrl = 0.0
+t_led = 0.0
+last_weather = ""
 
 while True:
     now = time.monotonic()
 
-    # ─── Button 7: Shift / Scale cycle ───────────────────────────────────────
-    b7 = buttons[7].value
-    if b7 != last_btn[7]:
-        last_btn[7] = b7
-        if not b7:
-            shift_on   = True
-            shift_used = False
-            pixel[0]   = (180, 180, 180)
-        else:
-            shift_on = False
-            if not shift_used:
-                cfg["scale"] = (cfg["scale"] + 1) % len(SCALES)
-                sc = SCALES[cfg["scale"]]
-                print(f"Scale → {sc['name']}")
-                flash(sc["letter"])
-                rekey_active_voices()
+    scan_inputs(now)
+    update_pending(now)
+    update_held(now)
 
-    # ─── Button 8: Breathe / Panic / Outro ───────────────────────────────────
-    b8 = buttons[8].value
-    if b8 != last_btn[8]:
-        last_btn[8] = b8
-        if not b8:
-            btn8_t = now
-        else:
-            if btn8_t is not None:
-                held   = now - btn8_t
-                btn8_t = None
+    if now - t_ctrl >= 0.033:
+        t_ctrl = now
+        update_wind(now)
+        update_timbre()
 
-                if shift_on:
-                    shift_used = True
-                    for _i in range(6):
-                        if voices[_i]["state"] in (WAKING, ACTIVE):
-                            begin_release(_i, now, OUTRO_DUR)
-                    flash("breathe", 1.0)
-                    print("Outro — slow release initiated")
+    if now - t_gfx >= 0.045:
+        t_gfx = now
+        update_particles(now)
+        render_matrix(now)
+        update_pixel(now)
+        if lightning and now > lightning[-1][1]:
+            del lightning[:]
 
-                elif held > 0.5:
-                    midi_panic()
-                    for _i in range(6):
-                        voices[_i] = new_voice(_i)
-                    breathe_on = False
-                    flash("panic", 0.8)
-                    print("Panic reset")
+    if now - t_led >= 0.02:
+        t_led = now
+        update_blue_led(now)
 
-                else:
-                    if breathe_on and not breathe_rev:
-                        breathe_rev   = True
-                        breathe_rev_t = now
-                        print("Breathe ← reversed")
-                    else:
-                        breathe_on  = True
-                        breathe_t0  = now
-                        breathe_rev = False
-                        breathe_cc7 = [100] * 6
-                        flash("breathe", 0.5)
-                        print("Breathe →")
+    wn = weather_name()
+    if wn != last_weather:
+        last_weather = wn
+        log("weather:", wn)
 
-    # ─── Buttons 1–6: Voice toggles & shift combos ───────────────────────────
-    for i in range(1, 7):
-        bv = buttons[i].value
-        if bv != last_btn[i]:
-            last_btn[i] = bv
-            if not bv:
-                if shift_on:
-                    shift_used = True
-
-                    if i == 1:
-                        cfg["root"] = max(0, cfg["root"] - 12)
-                        flash("oct_down")
-                        rekey_active_voices()
-                        print(f"Root → {cfg['root']}")
-
-                    elif i == 2:
-                        cfg["root"] = min(108, cfg["root"] + 12)
-                        flash("oct_up")
-                        rekey_active_voices()
-                        print(f"Root → {cfg['root']}")
-
-                    elif i == 3:
-                        cfg["gravity"] = (cfg["gravity"] + 1) % len(GRAVITY_NAMES)
-                        flash(GRAV_ICONS[cfg["gravity"]])
-                        print(f"Gravity → {GRAVITY_NAMES[cfg['gravity']]}")
-
-                    elif i == 4:
-                        cfg["drift_speed"] = (cfg["drift_speed"] + 1) % len(DRIFT_SPEEDS)
-                        flash(DRIFT_ICONS[cfg["drift_speed"]])
-                        print(f"Drift speed → {DRIFT_SPEED_NAMES[cfg['drift_speed']]}")
-
-                    elif i == 5:
-                        do_scatter(now)
-
-                    elif i == 6:
-                        for _j in range(6):
-                            begin_release(_j, now)
-                        flash("release_all")
-                        print("Release all voices")
-
-                else:
-                    toggle(i - 1, now)
-                    update_onboard_led()
-
-    # ─── Periodic updates ────────────────────────────────────────────────────
-    update_voices(now)
-    update_breathe(now)
-    update_pixel(now)
-    update_onboard_led()
-    render_matrix(now)
-
-    time.sleep(0.05)
+    time.sleep(0.002)
