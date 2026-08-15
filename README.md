@@ -152,7 +152,10 @@ release.
 
 ## Orientation
 
-The matrix is mounted turned relative to the drawing code. All artwork is
-written in logical coordinates (x = 0 left, y = 0 top) and rotated once, at
-blit time, by the `ROTATE` constant. If the scene comes out sideways, change
+All artwork is written in logical coordinates (x = 0 left, y = 0 top) and any
+correction for how the panel is mounted is applied once, at blit time, by the
+`ROTATE` constant. If the scene comes out sideways or upside down, change
 `ROTATE` — never the artwork.
+
+`ROTATE = 0` is confirmed correct against the physical panel: rain falls
+downward and splashes on the ground row.

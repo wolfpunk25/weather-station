@@ -541,11 +541,15 @@ def update_timbre():
 # ── Matrix graphics ──────────────────────────────────────────────────────────
 #
 # Drawing is done in LOGICAL coordinates: x = 0 is the left column, y = 0 is
-# the top row, as the panel reads when the box is in front of you. The panel
-# is mounted turned, so ROTATE is applied once, at blit time. Change ROTATE
-# (0 / 90 / 180 / 270) if the scene comes out sideways — never the artwork.
+# the top row, as the panel reads when the box is in front of you. Any
+# correction for how the panel is mounted is applied once, at blit time, by
+# ROTATE (0 / 90 / 180 / 270) — never by editing the artwork.
+#
+# ROTATE = 0 is CONFIRMED correct against the physical panel: rain falls
+# downward and splashes on the ground row. The old firmware's 180 flip was
+# wrong and turned the scene upside down. Do not change without a reason.
 
-ROTATE = 180
+ROTATE = 0
 
 
 def px(frame, x, y):
