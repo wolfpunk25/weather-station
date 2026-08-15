@@ -1,0 +1,5 @@
+# Adafruit libraries are installed from the CircuitPython bundle, not vendored
+lib/
+.DS_Store
+._*
+__pycache__/
