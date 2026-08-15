@@ -69,9 +69,18 @@ from adafruit_ht16k33.matrix import Matrix8x8
 
 # ── Hardware ─────────────────────────────────────────────────────────────────
 
+# Keycap number -> GPIO. VERIFIED BY MEASUREMENT 2026-08-15 with the DIAG
+# block below, not inferred. This is the soldered wiring and does not change;
+# the same pattern as the Hieroglyph board.
+#
+#         1
+#     2   4   7
+#     3   5   8
+#         6
+#
 PIN_MAP = {
-    1: "GP26", 2: "GP21", 3: "GP20", 4: "GP19",
-    5: "GP22", 6: "GP18", 7: "GP16", 8: "GP17",
+    1: "GP26", 2: "GP21", 3: "GP22", 4: "GP20",
+    5: "GP18", 6: "GP17", 7: "GP19", 8: "GP16",
 }
 
 SUN, WIND, RAIN = 1, 2, 3
@@ -122,6 +131,41 @@ for _k, _p in PIN_MAP.items():
     buttons[_k] = _b
 
 # ── MIDI out (USB + DIN/UART) ────────────────────────────────────────────────
+
+# ── Wiring diagnostic ────────────────────────────────────────────────────────
+# PIN_MAP above is the FUNCTION assignment and can be remapped freely. Which
+# GPIO sits behind each physical keycap is soldered and must be MEASURED, not
+# inferred: set DIAG = True, deploy, press the keycaps in order and read the
+# GPIO straight off the serial log.
+
+DIAG = False
+
+if DIAG:
+    mx.fill(0)
+    mx.show()
+    print("")
+    print("=" * 46)
+    print("WIRING DIAGNOSTIC - press keycaps 1 to 8 in order")
+    print("=" * 46)
+    _seq = 0
+    _prev = {s: True for s in PIN_MAP}
+    while True:
+        for _slot in PIN_MAP:
+            _v = buttons[_slot].value
+            if _v != _prev[_slot]:
+                _prev[_slot] = _v
+                if not _v:
+                    _seq += 1
+                    _down = [PIN_MAP[s] for s in sorted(PIN_MAP)
+                             if not buttons[s].value]
+                    print("press #%d  ->  %s   (down: %s)"
+                          % (_seq, PIN_MAP[_slot], ",".join(_down)))
+                    pixel[0] = (0, 120, 255)
+                else:
+                    print("             release %s" % PIN_MAP[_slot])
+                    pixel[0] = (0, 0, 0)
+                pixel.show()
+        time.sleep(0.005)
 
 usb_out = usb_midi.ports[1]
 uart = busio.UART(tx=board.GP4, baudrate=31250)

@@ -84,7 +84,7 @@ VCC-GND Studio YD-RP2040, CircuitPython 9.2.8.
 
 | | Pin |
 |---|---|
-| Keys 1-8 | GP26, GP21, GP20, GP19, GP22, GP18, GP16, GP17 |
+| Keys 1-8 | GP26, GP21, GP22, GP20, GP18, GP17, GP19, GP16 |
 | HT16K33 8x8 matrix | I2C, SCL GP1 / SDA GP0, address 0x70 |
 | NeoPixel | GP23 |
 | Blue LED | `board.LED` (PWM), falls back to GP25 |
@@ -92,6 +92,42 @@ VCC-GND Studio YD-RP2040, CircuitPython 9.2.8.
 
 Required libraries, from the CircuitPython bundle into `lib/` (not vendored
 here): `adafruit_ht16k33`, `neopixel.mpy`.
+
+## Key wiring
+
+Keycap layout:
+
+```
+    1
+2   4   7
+3   5   8
+    6
+```
+
+Keycap number to GPIO, **verified by measurement**, not inferred. This is the
+soldered wiring and does not change — `PIN_MAP` is only the function
+assignment and can be remapped freely.
+
+| Keycap | GPIO | | Keycap | GPIO |
+|---|---|---|---|---|
+| 1 | GP26 | | 5 | GP18 |
+| 2 | GP21 | | 6 | GP17 |
+| 3 | GP22 | | 7 | GP19 |
+| 4 | GP20 | | 8 | GP16 |
+
+Same pattern as the Hieroglyph board.
+
+To re-measure: set `DIAG = True` near the MIDI setup, deploy, and press the
+keycaps in order — every press logs the GPIO behind it to the serial console.
+Read it passively with:
+
+```bash
+python3 -c "import os,time; fd=os.open('/dev/cu.usbmodem2101',os.O_RDONLY); [print(os.read(fd,256).decode('utf8','replace'),end='') for _ in iter(int,1)]"
+```
+
+Do not infer this map from how the controls behave — on the Hieroglyph that
+approach produced a plausible-looking map that went unquestioned for several
+changes and had to be re-derived.
 
 ## Deploying
 
