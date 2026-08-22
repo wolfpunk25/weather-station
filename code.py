@@ -180,20 +180,73 @@ CH_THUNDER = 4  # MIDI channel 5
 ALL_CH = (CH_MAIN, CH_SUN, CH_RAIN, CH_WIND, CH_THUNDER)
 
 
-def _send(data):
-    usb_out.write(data)
-    uart.write(data)
+# The five layers assume a multitimbral receiver. A DAW over USB has no
+# trouble with that, but a hardware synth on the DIN socket usually listens to
+# ONE channel — so the sun chord (ch 2), the rain droplets (ch 3) and the wind
+# voice (ch 4) are simply never heard, and the modifiers appear to do nothing.
+#
+# DIN_CHANNEL folds every layer onto a single channel for the DIN output only.
+# USB always stays multitimbral.
+#
+#   DIN_CHANNEL = 0     fold everything onto MIDI channel 1  (default)
+#   DIN_CHANNEL = n     fold onto MIDI channel n+1
+#   DIN_CHANNEL = None  pass channels through untouched, for a multitimbral
+#                       rack or a second DAW on the DIN socket
+
+DIN_CHANNEL = 0
+
+_din_held = {}   # note number -> how many layers are holding it
+
+
+def _send(status, chan, d1, d2):
+    """Send to USB unchanged, and to the DIN socket folded if configured."""
+    usb_out.write(bytes([status | chan, d1, d2]))
+
+    if DIN_CHANNEL is None:
+        uart.write(bytes([status | chan, d1, d2]))
+        return
+
+    dc = DIN_CHANNEL
+
+    if status == 0x90:
+        # Layers overlap on one channel, so count holders per note and only
+        # strike a note that is not already sounding — otherwise a droplet
+        # would chop the note the same key is sustaining.
+        n = _din_held.get(d1, 0)
+        _din_held[d1] = n + 1
+        if n == 0:
+            uart.write(bytes([0x90 | dc, d1, d2]))
+
+    elif status == 0x80:
+        n = _din_held.get(d1, 0)
+        if n > 1:
+            _din_held[d1] = n - 1
+        else:
+            _din_held.pop(d1, None)
+            uart.write(bytes([0x80 | dc, d1, 0]))
+
+    elif status == 0xB0:
+        if d1 in (120, 123):
+            _din_held.clear()
+        # Only the main layer drives the shared controllers; the others would
+        # fight over them and waste DIN bandwidth.
+        if chan == CH_MAIN:
+            uart.write(bytes([0xB0 | dc, d1, d2]))
+
+    elif status == 0xE0:
+        if chan == CH_MAIN:
+            uart.write(bytes([0xE0 | dc, d1, d2]))
 
 
 def note_on(chan, note, vel=90):
     n = 0 if note < 0 else (127 if note > 127 else int(note))
     v = 1 if vel < 1 else (127 if vel > 127 else int(vel))
-    _send(bytes([0x90 | chan, n, v]))
+    _send(0x90, chan, n, v)
 
 
 def note_off(chan, note):
     n = 0 if note < 0 else (127 if note > 127 else int(note))
-    _send(bytes([0x80 | chan, n, 0]))
+    _send(0x80, chan, n, 0)
 
 
 _cc_cache = {}
@@ -205,7 +258,7 @@ def cc(chan, num, val, force=False):
     if not force and _cc_cache.get(key) == v:
         return
     _cc_cache[key] = v
-    _send(bytes([0xB0 | chan, num, v]))
+    _send(0xB0, chan, num, v)
 
 
 _bend_cache = {}
@@ -217,7 +270,7 @@ def bend(chan, value):
     if abs(_bend_cache.get(chan, 8192) - v) < 24:
         return
     _bend_cache[chan] = v
-    _send(bytes([0xE0 | chan, v & 0x7F, (v >> 7) & 0x7F]))
+    _send(0xE0, chan, v & 0x7F, (v >> 7) & 0x7F)
 
 
 def midi_panic():

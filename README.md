@@ -67,6 +67,32 @@ Continuous controllers: **CC1** mod (wind wobble), **CC74** brightness (sun
 opens the filter), **CC91** reverb (rain wets it), **CC10** pan (wind sweep),
 and **pitch bend** for gusts on channels 1, 2 and 4.
 
+## Hardware synths on the DIN socket
+
+The five-channel layout assumes a multitimbral receiver. A DAW over USB is
+fine with it, but a hardware synth on the DIN socket normally listens to
+**one** channel — and the sun chord, the rain droplets and the wind voice are
+on channels 2, 3 and 4. On such a synth RAIN produces nothing at all, and the
+modifiers appear dead.
+
+`DIN_CHANNEL`, near the MIDI setup, folds every layer onto a single channel
+for the DIN output only. USB always stays multitimbral.
+
+| Value | Effect |
+|---|---|
+| `0` (default) | fold everything onto MIDI channel 1 |
+| `n` | fold onto MIDI channel `n+1` |
+| `None` | pass channels through untouched — for a multitimbral rack |
+
+Folding counts how many layers hold each note, so a droplet can never cut off
+the note your finger is still sustaining, and a note is only released once the
+last layer lets go. Only the main layer drives the shared controllers and
+pitch bend, since the layers would otherwise fight over them.
+
+A side benefit: dropping those duplicate controller streams cuts DIN traffic
+to about a third of the USB traffic, which matters because the DIN runs at
+31250 baud (~1040 bytes/sec) while USB has no such ceiling.
+
 ## Displays
 
 - **8x8 matrix** — a live weather scene, not a readout. Horizon swell when

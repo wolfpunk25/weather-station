@@ -227,3 +227,55 @@ for si in range(len(ns["SCALES"])):
     print("%-9s ok  (oct %s: %s)" % (
         ns["SCALES"][si][0], ns["OCTAVE_NAMES"][oi],
         [ns["scale_note"](d) for d in range(5)]))
+
+print()
+print("=" * 62)
+print("DIN FOLD-DOWN (DIN_CHANNEL = %s)" % ns["DIN_CHANNEL"])
+print("=" * 62)
+
+uart = ns["uart"]
+
+def din_msgs(start):
+    b = bytes(uart.buf[start:])
+    return [b[i:i+3] for i in range(0, len(b) - 2, 3)]
+
+for mods, name in [((), "Clear"), ((SUN,), "SUN"), ((WIND,), "WIND"),
+                   ((RAIN,), "RAIN"), ((SUN, WIND, RAIN), "all three")]:
+    ns["do_panic"](); tick(4)
+    for m in mods: press(m)
+    tick(4)
+    i = len(uart.buf)
+    press(6); tick(45); rel(6); tick(8)
+    for m in mods: rel(m)
+    tick(6)
+    ons = [m for m in din_msgs(i) if m[0] & 0xF0 == 0x90]
+    chans = sorted(set((m[0] & 0x0F) + 1 for m in din_msgs(i)))
+    print("%-10s DIN note-ons: %-4d  distinct pitches: %-4d  channels used: %s"
+          % (name, len(ons), len(set(m[1] for m in ons)), chans))
+
+# The hard one: overlapping layers must not leave a note hanging on the
+# folded channel, and the hold-count must return to empty.
+ns["do_panic"](); tick(4)
+for m in (SUN, WIND, RAIN): press(m)
+for k in (4, 5, 6, 7, 8): press(k)
+tick(90)
+for k in (4, 5, 6, 7, 8): rel(k)
+for m in (SUN, WIND, RAIN): rel(m)
+tick(60)
+
+i = 0
+sounding = {}
+for m in din_msgs(0):
+    st, n = m[0] & 0xF0, m[1]
+    if st == 0x90: sounding[n] = sounding.get(n, 0) + 1
+    elif st == 0x80: sounding[n] = sounding.get(n, 0) - 1
+    elif st == 0xB0 and n in (120, 123): sounding = {}
+stuck = {k: v for k, v in sounding.items() if v > 0}
+print()
+print("DIN stuck notes after a full storm release:", stuck if stuck else "none")
+print("internal hold-count left over:", ns["_din_held"] if ns["_din_held"] else "empty")
+
+usb_bytes = sum(len(m) for m in port.msgs)
+din_bytes = len(uart.buf)
+print("USB bytes %d -> DIN bytes %d  (%.0f%% of USB traffic)"
+      % (usb_bytes, din_bytes, 100.0 * din_bytes / usb_bytes))
